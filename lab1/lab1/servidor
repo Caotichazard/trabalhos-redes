@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+
+
+# Aluno: Guilherme Locca Salomão
+# RA: 758569
+
+
+import asyncio
+from tcp import Servidor
+import re
+
+_DELIM = b'\r\n'
+
+conexoes_nome = {} #dicionário com todas as conexões atuais
+#canais_nome = {}
+
+#classe para menejo de canais
+class Canal:
+    lista_membros = {}#dicionário com todos os usuários conectados ao canal
+
+    #inicializador da classe, garante que certos atributos sejam definidos imediatamente
+    def __init__(self, nome):
+        self.lista_membros = {}
+        self.nome = nome
+
+    #adiciona um usuário a lista de usuario do canal e retorna para todos os membros a mensagem que o usuário se juntou ao canal
+    def user_join(self, conexao):
+        self.lista_membros[ conexao.apelido.lower() ] = conexao#adiciona o membro a lista
+        for membro in self.lista_membros:#para todos os membros
+            conn = self.lista_membros[membro]#cria a conexão com esse membro
+            resposta = b':' + conexao.apelido + b' JOIN :' + self.nome + _DELIM#define a mensagem a ser enviada
+            conn.enviar(resposta)#envia a mensagem
+
+        
+        membros = sorted(list(self.lista_membros))#organiza a lista em ordem alfabetica
+        base = b':server 353 ' + conexao.apelido + b' = ' + self.nome + b' :'#cria uma base para a mensagem com todos os usuários
+        mensagem = base
+
+        
+        mensagem += membros[0]#adiciona um membro a mensagem
+        for i in range(1, len(membros)):#adiciona membros a mensagem
+            membro = membros[i]
+            if len(mensagem + membro + b' ' + _DELIM) < 512:#até não estourar o limite de usuários
+                mensagem += b' ' + membro
+            else:
+                conexao.enviar(mensagem + _DELIM)#caso supere o limite já envia e cria a proxima mensagem
+                mensagem = base + b' ' + membro
+
+        conexao.enviar(mensagem + _DELIM)
+        mensagem = b':server 366 ' + conexao.apelido + b' ' + self.nome + b' :End of /NAMES list.'
+        conexao.enviar(mensagem + _DELIM)
+    
+    #caso o usuário deseje sair, remove o nome dele da lista de membros e avisa a todos os membros que ele saiu
+    def user_part(self, conexao):
+        for membro in self.lista_membros:
+            con = self.lista_membros[membro]
+            resposta = b':' + conexao.apelido + b' PART ' + self.nome + _DELIM
+            con.enviar(resposta)
+        
+        del self.lista_membros[conexao.apelido.lower()]
+
+    #caso o usuário tenha sido removido, só retira seu nome da lista, sem avisos para outros usuários
+    def user_remove(self, conexao):
+        del self.lista_membros[ conexao.apelido.lower() ]
+
+    #caso um usuário mande uma mesnagem, envia ela para todos os outros usuários
+    def enviar(self, mensagem):
+        
+        remetente, _ = mensagem.split(b' ', 1)
+        remetente = remetente[1:]
+        for membro in self.lista_membros:
+            
+            if membro != remetente:
+                
+                conn = self.lista_membros[membro]
+                conn.enviar(mensagem)
+        return
+
+def validar_nome(nome):
+    return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
+
+#fechar a conexão e avisa aos usuários que esta pessoa saiu do serviço
+def sair(conexao):
+    print(conexao, 'conexão fechada')
+
+    membros = {}
+    resposta = b':' + conexao.apelido + b' QUIT :Connection closed' + _DELIM
+
+    for canal in conexao.canais:
+        canal.user_remove(conexao)
+        for membro in canal.lista_membros:
+            membros[membro] = canal.lista_membros[membro]
+    
+    for membro in membros:
+        conn = membros[membro]
+        conn.enviar(resposta)
+
+    if conexao.apelido != b'*':
+        del conexoes_nome[conexao.apelido.lower()]
+
+    conexao.fechar()
+
+
+def dados_recebidos(conexao, dados):
+
+    #recebe o dados do request e prepara para tratamento
+    conexao.dados_residuais = conexao.dados_residuais + dados
+    
+    #no momento em que é possivel achar o delimitador dentro do possivel comando
+    while conexao.dados_residuais.find(_DELIM) != -1:
+
+        #separa o primeiro possivel comando do restante
+        dados, _, conexao.dados_residuais = conexao.dados_residuais.partition(_DELIM)
+        #adiciona o delimitador depois do possivel comando
+        dados += _
+
+        #interpreta o comando
+        if dados == b'':
+            return sair(conexao)
+
+        if dados.startswith(b'PING'):
+            ping(conexao,dados)
+
+        if dados.startswith(b'NICK'):
+            nick(conexao,dados)
+
+        if dados.startswith(b'PRIVMSG'):
+            privmsg(conexao,dados)
+
+        if dados.startswith(b'JOIN'):
+            join(conexao,dados)
+
+        if dados.startswith(b'PART'):
+            part(conexao,dados)
+
+    #caso comando vazio, encerra conexão
+    if dados == b'':
+        return sair(conexao)
+    
+    print(conexao, dados)
+
+
+def conexao_aceita(conexao):
+    print(conexao, 'nova conexão')
+    
+    conexao.registrar_recebedor(dados_recebidos)
+    conexao.dados_residuais = b''
+    conexao.apelido = b'*'
+    conexao.canais = []
+
+def ping(conexao, dados):
+    resposta = b':server PONG server :'
+    try:
+        resposta = resposta + dados.split(b' ', 1)[1]
+    except IndexError:
+        resposta = resposta + b''
+    conexao.enviar(resposta)
+
+def nick(conexao, dados):
+    try:
+        apelido = dados.split(b' ', 1)[1].split(_DELIM)[0]
+    except IndexError:
+        apelido = b''
+
+    if validar_nome(apelido):
+
+        if apelido.lower() in conexoes_nome:
+            resposta = b':server 433 ' + conexao.apelido + b' ' + apelido + b' :Nickname is already in use' + _DELIM
+            conexao.enviar(resposta)
+            
+        else:
+            if conexao.apelido == b'*':
+                conexoes_nome[apelido.lower()] = conexao
+                conexao.apelido = apelido
+
+                resposta = b':server 001 ' + apelido + b' :Welcome' + _DELIM
+                conexao.enviar(resposta)
+                resposta = b':server 422 ' + apelido + b' :MOTD File is missing' + _DELIM
+                conexao.enviar(resposta)
+            else:
+                del conexoes_nome[conexao.apelido.lower()]
+                conexoes_nome[apelido.lower()] = conexao
+
+                resposta = b':' + conexao.apelido + b' NICK ' + apelido + _DELIM
+                conexao.apelido = apelido
+                conexao.enviar(resposta)
+        
+    else:
+        resposta = b':server 432 ' + conexao.apelido + b' ' + apelido + b' :Erroneous nickname' + _DELIM
+        conexao.enviar(resposta)
+    
+    return
+
+def privmsg(conexao, dados):
+    
+    #_, destinatario, mensagem 
+    data = dados.strip(_DELIM).split(b' ', 2)
+    mensagem = data[2][1:]
+
+    if data[1].lower() not in conexoes_nome:
+        return
+    else:
+        conexao_destino = conexoes_nome[ data[1].lower() ]
+    
+    resposta = b':' + conexao.apelido + b' PRIVMSG ' + data[1] + b' :' + mensagem + _DELIM
+    conexao_destino.enviar(resposta)
+    return
+    
+def join(conexao, dados):
+    data = dados.strip(_DELIM).split(b' ', 1)
+
+    if data[1][0] != b'#' and not validar_nome(data[1][1:]):
+        resposta = b':server 403 ' + data[1] + b' :No such channel' + _DELIM
+        conexao.enviar(resposta)
+        return
+    
+    if data[1].lower() not in conexoes_nome:
+        canal = Canal(data[1])
+        conexoes_nome[canal.nome.lower()] = canal
+    else:
+        canal = conexoes_nome[data[1].lower()] 
+
+    conexao.canais.append(canal)
+    canal.user_join(conexao)
+    return
+
+def part(conexao, dados):
+    data = dados.strip(_DELIM).split(b' ')
+
+    #if nome_canal.find(b' ') != -1:
+       # nome_canal, _ = nome_canal.split(b' ', 1)
+
+    if data[1][0] != b'#' and not validar_nome(data[1][1:]):
+        resposta = b':server 403 ' + data[1] + b' :No such channel' + _DELIM
+        conexao.enviar(resposta)
+        return
+    
+    if data[1].lower() not in conexoes_nome:
+        canal = Canal(data[1])
+        conexoes_nome[canal.nome.lower()] = canal
+    else:
+        canal = conexoes_nome[data[1].lower()] 
+    
+    conexao.canais.remove(canal)
+    canal.user_part(conexao)
+    return
+
+servidor = Servidor(6667)
+servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
+asyncio.get_event_loop().run_forever()
